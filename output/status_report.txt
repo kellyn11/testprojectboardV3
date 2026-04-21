@@ -5,4 +5,35 @@ Legend:
 [-] In Progress
 [ ] Todo
 
-Export stub created.
+2.1 User Management
+[X] US1 - As a user, I want to create an account so that I can access personalized features.
+
+[X] US2 - As a user, I want to log in so that I can access my account.
+
+[ ] US3 - As a user, I want to reset my password so that I can regain access.
+
+[ ] US4 - As a user, I want to update my profile so that my details stay current.
+
+2.2 Shopping
+[ ] US5 - As a user, I want to browse products so that I can find items to buy.
+
+[ ] US6 - As a user, I want to add items to cart so that I can purchase multiple items.
+
+[ ] US7 - As a user, I want to checkout so that I can complete my purchase.
+
+[ ] US8 - As a user, I want to view past orders so that I can track purchases.
+
+2.1 User Management
+[ ] US9 - As an admin, I want to view user accounts so that I can manage users.
+
+[X] US10 - As a user, I want to log out so that I can securely exit my account.
+
+2.2 Shopping
+[ ] US11 - As a user, i want to search for past orders so I can find the purchase easily.
+
+[ ] US12 - As a user, I want to delete items from the cart so that I can remove unnecessary items
+
+[ ] US13 - As a user, I want to seek help from the FAQ section
+
+Completion: 3 / 13 Completed
+Progress: 23%
