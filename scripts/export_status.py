@@ -30,7 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
           OWNER: kellyn11
-          PROJECT_NUMBER: 1
+          PROJECT_NUMBER: 6
         run: |
           python scripts/export_status.py
 
