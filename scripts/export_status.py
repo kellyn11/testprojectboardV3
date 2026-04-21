@@ -1,13 +1,15 @@
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from docx import Document
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.pdfgen import canvas
-import os
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.units import mm
 
 
 REPO = os.environ["REPO"]
@@ -142,54 +144,86 @@ def marker_for_status(status: str) -> str:
     return "[ ]"
 
 
-def wrap_text(text: str, font_name: str, font_size: int, max_width: float):
-    words = text.split()
-    if not words:
-        return [""]
-
-    lines = []
-    current = words[0]
-
-    for word in words[1:]:
-        test = current + " " + word
-        if stringWidth(test, font_name, font_size) <= max_width:
-            current = test
-        else:
-            lines.append(current)
-            current = word
-
-    lines.append(current)
-    return lines
+def format_acceptance(ac_lines):
+    if not ac_lines:
+        return ""
+    return "\n".join(ac_lines)
 
 
 def write_txt_report(rows, status_map):
     done_count = 0
     total_count = len(rows)
 
-    lines = [
-        "Project Functional Requirement Progress",
-        "",
-        "Legend:",
-        "[X] Done",
-        "[-] In Progress",
-        "[ ] Todo",
-        "",
-    ]
+    # widths
+    sn_w = 4
+    st_w = 8
+    us_w = 55
+    ac_w = 40
+
+    def wrap(text, width):
+        words = text.split()
+        if not words:
+            return [""]
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            test = current + " " + word
+            if len(test) <= width:
+                current = test
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def row_border():
+        return "+" + "-" * (sn_w + 2) + "+" + "-" * (st_w + 2) + "+" + "-" * (us_w + 2) + "+" + "-" * (ac_w + 2) + "+"
+
+    lines = []
+    lines.append("Project Functional Requirement Progress")
+    lines.append("")
+    lines.append("Legend:")
+    lines.append("[X] Done")
+    lines.append("[-] In Progress")
+    lines.append("[ ] Todo")
+    lines.append("")
 
     current_section = None
+
     for row in rows:
         if row["section"] != current_section:
             current_section = row["section"]
             lines.append(current_section)
+            lines.append(row_border())
+            lines.append(
+                f"| {'SN'.ljust(sn_w)} | {'Status'.ljust(st_w)} | {'User Stories'.ljust(us_w)} | {'Acceptance Criteria'.ljust(ac_w)} |"
+            )
+            lines.append(row_border())
 
         status = status_map.get(row["sn"], "Todo")
         marker = marker_for_status(status)
         if marker == "[X]":
             done_count += 1
 
-        lines.append(f"{marker} {row['id']} - {row['story']}")
-        lines.append("")
+        story_lines = wrap(row["story"], us_w)
+        ac_lines = []
+        for ac in row["acceptance"]:
+            ac_lines.extend(wrap(ac, ac_w))
+        if not ac_lines:
+            ac_lines = [""]
 
+        max_lines = max(len(story_lines), len(ac_lines))
+
+        for i in range(max_lines):
+            sn = str(row["sn"]).ljust(sn_w) if i == 0 else " " * sn_w
+            st = marker.ljust(st_w) if i == 0 else " " * st_w
+            us = story_lines[i].ljust(us_w) if i < len(story_lines) else " " * us_w
+            ac = ac_lines[i].ljust(ac_w) if i < len(ac_lines) else " " * ac_w
+            lines.append(f"| {sn} | {st} | {us} | {ac} |")
+
+        lines.append(row_border())
+
+    lines.append("")
     lines.append(f"Completion: {done_count} / {total_count} Completed")
     progress = round((done_count / total_count) * 100) if total_count else 0
     lines.append(f"Progress: {progress}%")
@@ -201,68 +235,98 @@ def write_txt_report(rows, status_map):
 def write_pdf_report(rows, status_map):
     PDF_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 
-    c = canvas.Canvas(str(PDF_OUTPUT), pagesize=A4)
-    width, height = A4
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    normal_style = styles["BodyText"]
+    normal_style.fontName = "Helvetica"
+    normal_style.fontSize = 9
+    normal_style.leading = 11
 
-    left = 50
-    right = 50
-    top = height - 50
-    bottom = 50
-    line_gap = 16
-    usable_width = width - left - right
+    section_style = styles["Heading3"]
+    section_style.fontName = "Helvetica-Bold"
+    section_style.fontSize = 11
+    section_style.leading = 13
 
-    done_count = sum(
-        1 for r in rows if marker_for_status(status_map.get(r["sn"], "Todo")) == "[X]"
+    doc = SimpleDocTemplate(
+        str(PDF_OUTPUT),
+        pagesize=landscape(A4),
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
     )
+
+    elements = []
+
+    done_count = 0
     total_count = len(rows)
-    progress = round((done_count / total_count) * 100) if total_count else 0
 
-    y = top
-
-    def new_page():
-        nonlocal y
-        c.showPage()
-        y = top
-
-    def draw_line(text, font="Helvetica", size=11, indent=0):
-        nonlocal y
-        max_width = usable_width - indent
-        wrapped = wrap_text(text, font, size, max_width)
-        for part in wrapped:
-            if y < bottom:
-                new_page()
-            c.setFont(font, size)
-            c.drawString(left + indent, y, part)
-            y -= line_gap
-
-    c.setTitle("Project Functional Requirement Progress")
-
-    draw_line("Project Functional Requirement Progress", font="Helvetica-Bold", size=16)
-    y -= 4
-    draw_line("Legend:", font="Helvetica-Bold", size=11)
-    draw_line("[X] Done")
-    draw_line("[-] In Progress")
-    draw_line("[ ] Todo")
-    y -= 6
+    elements.append(Paragraph("Project Functional Requirement Progress", title_style))
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph("Legend: [X] Done &nbsp;&nbsp;&nbsp; [-] In Progress &nbsp;&nbsp;&nbsp; [ ] Todo", normal_style))
+    elements.append(Spacer(1, 10))
 
     current_section = None
+
     for row in rows:
-        section = row["section"]
-        if section != current_section:
-            current_section = section
-            y -= 4
-            draw_line(section, font="Helvetica-Bold", size=12)
+        if row["section"] != current_section:
+            current_section = row["section"]
+            elements.append(Paragraph(current_section, section_style))
+            elements.append(Spacer(1, 4))
 
-        status = status_map.get(row["sn"], "Todo")
-        marker = marker_for_status(status)
-        draw_line(f"{marker} {row['id']} - {row['story']}", font="Helvetica", size=11)
-        y -= 2
+            table_data = [[
+                Paragraph("<b>SN</b>", normal_style),
+                Paragraph("<b>Status</b>", normal_style),
+                Paragraph("<b>User Stories</b>", normal_style),
+                Paragraph("<b>Acceptance Criteria</b>", normal_style),
+            ]]
 
-    y -= 8
-    draw_line(f"Completion: {done_count} / {total_count} Completed", font="Helvetica-Bold", size=11)
-    draw_line(f"Progress: {progress}%", font="Helvetica-Bold", size=11)
+            section_rows = [r for r in rows if r["section"] == current_section]
 
-    c.save()
+            for r in section_rows:
+                status = status_map.get(r["sn"], "Todo")
+                marker = marker_for_status(status)
+                if marker == "[X]":
+                    done_count += 1
+
+                ac_text = "<br/>".join(r["acceptance"]) if r["acceptance"] else ""
+
+                table_data.append([
+                    Paragraph(str(r["sn"]), normal_style),
+                    Paragraph(marker, normal_style),
+                    Paragraph(r["story"], normal_style),
+                    Paragraph(ac_text, normal_style),
+                ])
+
+            tbl = Table(
+                table_data,
+                colWidths=[15 * mm, 22 * mm, 110 * mm, 110 * mm],
+                repeatRows=1,
+            )
+
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("LEADING", (0, 0), (-1, -1), 11),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+
+            elements.append(tbl)
+            elements.append(Spacer(1, 10))
+
+    progress = round((done_count / total_count) * 100) if total_count else 0
+    elements.append(Paragraph(f"<b>Completion:</b> {done_count} / {total_count} Completed", normal_style))
+    elements.append(Paragraph(f"<b>Progress:</b> {progress}%", normal_style))
+
+    doc.build(elements)
 
 
 def main():
@@ -270,7 +334,7 @@ def main():
         raise FileNotFoundError(f"Missing {DOCX_PATH}")
 
     rows = extract_story_rows_from_docx()
-    rows.sort(key=lambda x: x["sn"])
+    rows.sort(key=lambda x: (x["section"], x["sn"]))
 
     status_map = get_issue_status_map()
 
