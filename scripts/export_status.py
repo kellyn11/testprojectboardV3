@@ -1,15 +1,16 @@
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
+
 from docx import Document
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
+import os
 
-OWNER = os.environ["OWNER"]
-PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
+
+REPO = os.environ["REPO"]
 DOCX_PATH = Path("input/stories.docx")
 TXT_OUTPUT = Path("output/status_report.txt")
 PDF_OUTPUT = Path("output/status_report.pdf")
@@ -20,7 +21,7 @@ def run_gh(args):
         ["gh"] + args,
         capture_output=True,
         text=True,
-        check=True
+        check=True,
     )
     return result.stdout.strip()
 
@@ -78,78 +79,54 @@ def extract_story_rows_from_docx():
                 if line:
                     ac_lines.append(line)
 
-            rows_out.append({
-                "sn": int(sn),
-                "id": f"US{sn}",
-                "section": current_section,
-                "story": story,
-                "acceptance": ac_lines,
-            })
+            rows_out.append(
+                {
+                    "sn": int(sn),
+                    "id": f"US{sn}",
+                    "section": current_section,
+                    "story": story,
+                    "acceptance": ac_lines,
+                }
+            )
 
     return rows_out
 
 
-def get_project_items():
-    query = """
-    query($owner:String!, $number:Int!) {
-      user(login:$owner) {
-        projectV2(number:$number) {
-          items(first:100) {
-            nodes {
-              fieldValues(first:20) {
-                nodes {
-                  ... on ProjectV2ItemFieldSingleSelectValue {
-                    name
-                    field {
-                      ... on ProjectV2SingleSelectField {
-                        name
-                      }
-                    }
-                  }
-                }
-              }
-              content {
-                ... on Issue {
-                  title
-                  number
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
+def get_issue_status_map():
+    out = run_gh(
+        [
+            "issue",
+            "list",
+            "--repo",
+            REPO,
+            "--state",
+            "all",
+            "--limit",
+            "200",
+            "--json",
+            "title,state,labels",
+        ]
+    )
 
-    out = run_gh([
-        "api", "graphql",
-        "-f", f"query={query}",
-        "-F", f"owner={OWNER}",
-        "-F", f"number={PROJECT_NUMBER}",
-    ])
-
-    data = json.loads(out)
-    nodes = data["data"]["user"]["projectV2"]["items"]["nodes"]
-
+    issues = json.loads(out)
     status_map = {}
-    for item in nodes:
-        content = item.get("content")
-        if not content:
-            continue
 
-        title = content.get("title", "")
+    for issue in issues:
+        title = issue.get("title", "")
         m = re.match(r"^US(\d+)\b", title)
         if not m:
             continue
 
         sn = int(m.group(1))
-        status = "Todo"
+        state = (issue.get("state") or "").lower()
+        labels = [lbl.get("name", "").lower() for lbl in issue.get("labels", [])]
 
-        for fv in item.get("fieldValues", {}).get("nodes", []):
-            field = fv.get("field")
-            if field and field.get("name") == "Status":
-                status = fv.get("name", "Todo")
-                break
+        if state == "closed":
+            status = "Done"
+        elif "in-progress" in labels:
+            status = "In Progress"
+        else:
+            status = "Todo"
 
         status_map[sn] = status
 
@@ -180,6 +157,7 @@ def wrap_text(text: str, font_name: str, font_size: int, max_width: float):
         else:
             lines.append(current)
             current = word
+
     lines.append(current)
     return lines
 
@@ -198,14 +176,20 @@ def write_txt_report(rows, status_map):
         "",
     ]
 
+    current_section = None
     for row in rows:
+        if row["section"] != current_section:
+            current_section = row["section"]
+            lines.append(current_section)
+
         status = status_map.get(row["sn"], "Todo")
         marker = marker_for_status(status)
         if marker == "[X]":
             done_count += 1
-        lines.append(f"{marker} {row['id']} - {row['story']}")
 
-    lines.append("")
+        lines.append(f"{marker} {row['id']} - {row['story']}")
+        lines.append("")
+
     lines.append(f"Completion: {done_count} / {total_count} Completed")
     progress = round((done_count / total_count) * 100) if total_count else 0
     lines.append(f"Progress: {progress}%")
@@ -227,7 +211,9 @@ def write_pdf_report(rows, status_map):
     line_gap = 16
     usable_width = width - left - right
 
-    done_count = sum(1 for r in rows if marker_for_status(status_map.get(r["sn"], "Todo")) == "[X]")
+    done_count = sum(
+        1 for r in rows if marker_for_status(status_map.get(r["sn"], "Todo")) == "[X]"
+    )
     total_count = len(rows)
     progress = round((done_count / total_count) * 100) if total_count else 0
 
@@ -270,6 +256,7 @@ def write_pdf_report(rows, status_map):
         status = status_map.get(row["sn"], "Todo")
         marker = marker_for_status(status)
         draw_line(f"{marker} {row['id']} - {row['story']}", font="Helvetica", size=11)
+        y -= 2
 
     y -= 8
     draw_line(f"Completion: {done_count} / {total_count} Completed", font="Helvetica-Bold", size=11)
@@ -285,7 +272,7 @@ def main():
     rows = extract_story_rows_from_docx()
     rows.sort(key=lambda x: x["sn"])
 
-    status_map = get_project_items()
+    status_map = get_issue_status_map()
 
     write_txt_report(rows, status_map)
     write_pdf_report(rows, status_map)
