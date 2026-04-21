@@ -28,7 +28,7 @@ jobs:
 
       - name: Run export status script
         env:
-          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           OWNER: kellyn11
           PROJECT_NUMBER: 6
         run: |
