@@ -10,7 +10,6 @@ jobs:
     permissions:
       contents: write
       issues: read
-      pull-requests: read
 
     steps:
       - name: Checkout repository
@@ -29,8 +28,7 @@ jobs:
       - name: Run export status script
         env:
           GH_TOKEN: ${{ github.token }}
-          OWNER: kellyn11
-          PROJECT_NUMBER: 6
+          REPO: ${{ github.repository }}
         run: |
           python scripts/export_status.py
 
