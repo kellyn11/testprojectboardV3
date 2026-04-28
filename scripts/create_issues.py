@@ -9,7 +9,7 @@ OWNER = os.environ["OWNER"]
 REPO = os.environ["REPO"]
 PROJECT_OWNER = os.environ["PROJECT_OWNER"]
 PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
-DEFAULT_STATUS = os.environ.get("DEFAULT_STATUS", "Todo")
+DEFAULT_STATUS = os.environ.get("DEFAULT_STATUS", "Backlog")
 
 DOCX_PATH = Path("input/stories.docx")
 
