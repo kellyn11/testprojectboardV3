@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from docx import Document
 
@@ -16,7 +17,12 @@ DOCX_PATH = Path("input/stories.docx")
 
 
 def run_gh(args):
-    result = subprocess.run(["gh"] + args, capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        ["gh"] + args,
+        capture_output=True,
+        text=True,
+        check=True
+    )
     return result.stdout.strip()
 
 
@@ -27,7 +33,11 @@ def clean_text(text):
 def generate_title_from_story(story):
     match = re.search(r"I want to (.*?)(?: so that|$)", story, re.IGNORECASE)
     title = match.group(1).strip() if match else story.strip()
-    return title[:1].upper() + title[1:] if title else "Untitled Story"
+
+    if not title:
+        return "Untitled Story"
+
+    return title[:1].upper() + title[1:]
 
 
 def extract_story_rows_from_docx():
@@ -177,23 +187,12 @@ def create_or_update_ac_comment(issue_number, row):
         print(f"Created AC checkbox comment for issue #{issue_number}")
 
 
-def get_project_id_and_status_field():
+def get_project_info():
     query = """
     query($owner:String!, $number:Int!) {
       user(login:$owner) {
         projectV2(number:$number) {
           id
-          items(first:100) {
-            nodes {
-              id
-              content {
-                ... on Issue {
-                  number
-                  title
-                }
-              }
-            }
-          }
           fields(first:50) {
             nodes {
               ... on ProjectV2SingleSelectField {
@@ -225,21 +224,49 @@ def get_project_id_and_status_field():
         raise RuntimeError("Project not found. Check PROJECT_OWNER and PROJECT_NUMBER.")
 
     status_field = None
+
     for field in project["fields"]["nodes"]:
         if field and field.get("name") == "Status":
             status_field = field
             break
 
     if not status_field:
-        raise RuntimeError("Status field not found.")
+        raise RuntimeError("Status field not found in project.")
 
-    project_items = project["items"]["nodes"]
-
-    return project["id"], status_field, project_items
+    return project["id"], status_field
 
 
-def find_project_item_id(project_items, issue_number):
-    for item in project_items:
+def get_project_item_id_for_issue(project_id, issue_number):
+    query = """
+    query($projectId:ID!) {
+      node(id:$projectId) {
+        ... on ProjectV2 {
+          items(first:100) {
+            nodes {
+              id
+              content {
+                ... on Issue {
+                  number
+                  title
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    output = run_gh([
+        "api", "graphql",
+        "-f", f"query={query}",
+        "-F", f"projectId={project_id}"
+    ])
+
+    data = json.loads(output)
+    items = data["data"]["node"]["items"]["nodes"]
+
+    for item in items:
         content = item.get("content")
         if content and content.get("number") == issue_number:
             return item["id"]
@@ -313,34 +340,72 @@ def update_project_status(project_id, item_id, status_field, status_name):
     print(f"Moved project item to {status_name}")
 
 
+def ensure_issue_in_project_with_status(project_id, status_field, issue_number, issue_node_id):
+    item_id = get_project_item_id_for_issue(project_id, issue_number)
+
+    if not item_id:
+        item_id = add_issue_to_project(project_id, issue_node_id)
+        print(f"Added issue #{issue_number} to project")
+
+        # Give GitHub time to finish adding the item
+        time.sleep(2)
+
+        item_id = get_project_item_id_for_issue(project_id, issue_number)
+
+        if not item_id:
+            raise RuntimeError(f"Issue #{issue_number} was added but cannot be found in project.")
+
+    else:
+        print(f"Issue #{issue_number} already exists in project")
+
+    for attempt in range(1, 4):
+        try:
+            update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
+            return
+        except Exception as error:
+            print(f"Status update failed for issue #{issue_number}, attempt {attempt}/3")
+            print(error)
+            time.sleep(2)
+
+    raise RuntimeError(f"Failed to set status for issue #{issue_number} after 3 attempts.")
+
+
 def main():
     if not DOCX_PATH.exists():
         raise FileNotFoundError("Missing input/stories.docx")
 
     rows = extract_story_rows_from_docx()
 
+    print(f"Found {len(rows)} user stories in DOCX")
+
     if not rows:
         raise RuntimeError(
             "No stories found. Header must be: User Stories | Acceptance Criteria"
         )
 
-    project_id, status_field, project_items = get_project_id_and_status_field()
+    project_id, status_field = get_project_info()
 
-    for row in rows:
+    imported_issues = []
+
+    for index, row in enumerate(rows, start=1):
+        print(f"Importing {index}/{len(rows)}: {row['title']}")
+
         issue_number, issue_node_id = create_or_update_issue(row)
         create_or_update_ac_comment(issue_number, row)
 
-        item_id = find_project_item_id(project_items, issue_number)
+        ensure_issue_in_project_with_status(
+            project_id,
+            status_field,
+            issue_number,
+            issue_node_id
+        )
 
-        if not item_id:
-            item_id = add_issue_to_project(project_id, issue_node_id)
-            print(f"Added issue #{issue_number} to project")
-        else:
-            print(f"Issue #{issue_number} already exists in project")
+        imported_issues.append(issue_number)
 
-        update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
-
-        print(f"Imported/repaired issue #{issue_number}: {row['title']}")
+    print("Import completed.")
+    print(f"Expected DOCX stories: {len(rows)}")
+    print(f"Imported/repaired issues: {len(imported_issues)}")
+    print(f"Issue numbers: {imported_issues}")
 
 
 if __name__ == "__main__":
