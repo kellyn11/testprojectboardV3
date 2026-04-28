@@ -28,6 +28,20 @@ def clean_text(text):
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def generate_title_from_story(story):
+    match = re.search(r"I want to (.*?)(?: so that|$)", story, re.IGNORECASE)
+
+    if match:
+        title = match.group(1).strip()
+    else:
+        title = story.strip()
+
+    if not title:
+        return "Untitled Story"
+
+    return title[:1].upper() + title[1:]
+
+
 def extract_story_rows_from_docx():
     doc = Document(str(DOCX_PATH))
     rows_out = []
@@ -39,7 +53,7 @@ def extract_story_rows_from_docx():
 
         header = [clean_text(c.text) for c in rows[0].cells[:2]]
 
-        # EXPECTS:
+        # Word table must be:
         # User Stories | Acceptance Criteria
         if header != ["User Stories", "Acceptance Criteria"]:
             continue
@@ -62,6 +76,7 @@ def extract_story_rows_from_docx():
                     ac_lines.append(line)
 
             rows_out.append({
+                "title": generate_title_from_story(story),
                 "story": story,
                 "acceptance": ac_lines
             })
@@ -69,33 +84,33 @@ def extract_story_rows_from_docx():
     return rows_out
 
 
-def find_existing_issue_by_title(story):
+def find_existing_issue_by_title(title):
     output = run_gh([
         "issue", "list",
         "--repo", f"{OWNER}/{REPO}",
         "--state", "all",
-        "--search", story,
+        "--search", title,
         "--json", "number,title,state"
     ])
 
     issues = json.loads(output)
 
     for issue in issues:
-        if clean_text(issue["title"]) == clean_text(story):
+        if clean_text(issue["title"]) == clean_text(title):
             return issue
 
     return None
 
 
 def create_or_update_issue(row):
-    title = row["story"]
+    title = row["title"]
 
     body = f"""User Story:
 
 {row["story"]}
 """
 
-    existing = find_existing_issue_by_title(row["story"])
+    existing = find_existing_issue_by_title(title)
 
     if existing:
         issue_number = existing["number"]
@@ -118,7 +133,7 @@ def create_or_update_issue(row):
             f"repos/{OWNER}/{REPO}/issues/{issue_number}"
         ]))
 
-        print(f"Updated existing issue #{issue_number}")
+        print(f"Updated existing issue #{issue_number}: {title}")
         return issue_number, issue_data["node_id"]
 
     output = run_gh([
@@ -130,7 +145,7 @@ def create_or_update_issue(row):
 
     issue = json.loads(output)
 
-    print(f"Created issue #{issue['number']}")
+    print(f"Created issue #{issue['number']}: {title}")
     return issue["number"], issue["node_id"]
 
 
@@ -321,7 +336,7 @@ def main():
         except subprocess.CalledProcessError:
             print(f"Issue #{issue_number} may already be in the project. Skipping project add.")
 
-        print(f"Imported issue #{issue_number}")
+        print(f"Imported issue #{issue_number}: {row['title']}")
 
 
 if __name__ == "__main__":
