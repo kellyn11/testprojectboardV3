@@ -10,6 +10,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      repository-projects: write
 
     steps:
       - name: Checkout repository
@@ -28,6 +29,8 @@ jobs:
       - name: Run issue sync script
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          OWNER: kellyn11
+          REPO: testprojectboardV4_1
+          PROJECT_NUMBER: 6
         run: |
           python scripts/create_issues.py
