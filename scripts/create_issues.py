@@ -1,3 +1,4 @@
+# scripts/create_issues.py
 import json
 import os
 import re
@@ -15,12 +16,7 @@ DOCX_PATH = Path("input/stories.docx")
 
 
 def run_gh(args):
-    result = subprocess.run(
-        ["gh"] + args,
-        capture_output=True,
-        text=True,
-        check=True
-    )
+    result = subprocess.run(["gh"] + args, capture_output=True, text=True, check=True)
     return result.stdout.strip()
 
 
@@ -30,16 +26,8 @@ def clean_text(text):
 
 def generate_title_from_story(story):
     match = re.search(r"I want to (.*?)(?: so that|$)", story, re.IGNORECASE)
-
-    if match:
-        title = match.group(1).strip()
-    else:
-        title = story.strip()
-
-    if not title:
-        return "Untitled Story"
-
-    return title[:1].upper() + title[1:]
+    title = match.group(1).strip() if match else story.strip()
+    return title[:1].upper() + title[1:] if title else "Untitled Story"
 
 
 def extract_story_rows_from_docx():
@@ -53,8 +41,6 @@ def extract_story_rows_from_docx():
 
         header = [clean_text(c.text) for c in rows[0].cells[:2]]
 
-        # Word table must be:
-        # User Stories | Acceptance Criteria
         if header != ["User Stories", "Acceptance Criteria"]:
             continue
 
@@ -78,7 +64,7 @@ def extract_story_rows_from_docx():
             rows_out.append({
                 "title": generate_title_from_story(story),
                 "story": story,
-                "acceptance": ac_lines
+                "acceptance": ac_lines,
             })
 
     return rows_out
@@ -133,7 +119,7 @@ def create_or_update_issue(row):
             f"repos/{OWNER}/{REPO}/issues/{issue_number}"
         ]))
 
-        print(f"Updated existing issue #{issue_number}: {title}")
+        print(f"Updated issue #{issue_number}: {title}")
         return issue_number, issue_data["node_id"]
 
     output = run_gh([
@@ -150,10 +136,7 @@ def create_or_update_issue(row):
 
 
 def build_ac_comment(row):
-    lines = [
-        "Acceptance Criteria",
-        ""
-    ]
+    lines = ["Acceptance Criteria", ""]
 
     for ac in row["acceptance"]:
         lines.append(f"- [ ] {ac}")
@@ -178,15 +161,12 @@ def create_or_update_ac_comment(issue_number, row):
             break
 
     if existing_ac_comment:
-        comment_id = existing_ac_comment["id"]
-
         run_gh([
             "api",
             "--method", "PATCH",
-            f"repos/{OWNER}/{REPO}/issues/comments/{comment_id}",
+            f"repos/{OWNER}/{REPO}/issues/comments/{existing_ac_comment['id']}",
             "-f", f"body={ac_body}"
         ])
-
         print(f"Updated AC checkbox comment for issue #{issue_number}")
     else:
         run_gh([
@@ -194,7 +174,6 @@ def create_or_update_ac_comment(issue_number, row):
             f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments",
             "-f", f"body={ac_body}"
         ])
-
         print(f"Created AC checkbox comment for issue #{issue_number}")
 
 
@@ -204,6 +183,17 @@ def get_project_id_and_status_field():
       user(login:$owner) {
         projectV2(number:$number) {
           id
+          items(first:100) {
+            nodes {
+              id
+              content {
+                ... on Issue {
+                  number
+                  title
+                }
+              }
+            }
+          }
           fields(first:50) {
             nodes {
               ... on ProjectV2SingleSelectField {
@@ -235,7 +225,6 @@ def get_project_id_and_status_field():
         raise RuntimeError("Project not found. Check PROJECT_OWNER and PROJECT_NUMBER.")
 
     status_field = None
-
     for field in project["fields"]["nodes"]:
         if field and field.get("name") == "Status":
             status_field = field
@@ -244,7 +233,18 @@ def get_project_id_and_status_field():
     if not status_field:
         raise RuntimeError("Status field not found.")
 
-    return project["id"], status_field
+    project_items = project["items"]["nodes"]
+
+    return project["id"], status_field, project_items
+
+
+def find_project_item_id(project_items, issue_number):
+    for item in project_items:
+        content = item.get("content")
+        if content and content.get("number") == issue_number:
+            return item["id"]
+
+    return None
 
 
 def add_issue_to_project(project_id, issue_node_id):
@@ -324,19 +324,23 @@ def main():
             "No stories found. Header must be: User Stories | Acceptance Criteria"
         )
 
-    project_id, status_field = get_project_id_and_status_field()
+    project_id, status_field, project_items = get_project_id_and_status_field()
 
     for row in rows:
         issue_number, issue_node_id = create_or_update_issue(row)
         create_or_update_ac_comment(issue_number, row)
 
-        try:
-            item_id = add_issue_to_project(project_id, issue_node_id)
-            update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
-        except subprocess.CalledProcessError:
-            print(f"Issue #{issue_number} may already be in the project. Skipping project add.")
+        item_id = find_project_item_id(project_items, issue_number)
 
-        print(f"Imported issue #{issue_number}: {row['title']}")
+        if not item_id:
+            item_id = add_issue_to_project(project_id, issue_node_id)
+            print(f"Added issue #{issue_number} to project")
+        else:
+            print(f"Issue #{issue_number} already exists in project")
+
+        update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
+
+        print(f"Imported/repaired issue #{issue_number}: {row['title']}")
 
 
 if __name__ == "__main__":
