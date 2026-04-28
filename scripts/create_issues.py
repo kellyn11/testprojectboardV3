@@ -7,6 +7,9 @@ from docx import Document
 
 OWNER = os.environ["OWNER"]
 REPO = os.environ["REPO"]
+PROJECT_OWNER = os.environ["PROJECT_OWNER"]
+PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
+DEFAULT_STATUS = os.environ.get("DEFAULT_STATUS", "Todo")
 
 DOCX_PATH = Path("input/stories.docx")
 
@@ -36,8 +39,6 @@ def extract_story_rows_from_docx():
 
         header = [clean_text(c.text) for c in rows[0].cells[:3]]
 
-        # EXPECTS:
-        # SN | User Stories | Acceptance Criteria
         if header != ["SN", "User Stories", "Acceptance Criteria"]:
             continue
 
@@ -98,22 +99,20 @@ def create_issue(row):
 """
 
     output = run_gh([
-        "issue", "create",
-        "--repo", f"{OWNER}/{REPO}",
-        "--title", title,
-        "--body", body,
-        "--json", "number"
+        "api",
+        f"repos/{OWNER}/{REPO}/issues",
+        "-f", f"title={title}",
+        "-f", f"body={body}"
     ])
 
     issue = json.loads(output)
-    return issue["number"]
+
+    print(f'Created {row["id"]} as issue #{issue["number"]}')
+    return issue["number"], issue["node_id"]
 
 
 def add_ac_comment(issue_number, row):
-    lines = [
-        "Acceptance Criteria",
-        ""
-    ]
+    lines = ["Acceptance Criteria", ""]
 
     for ac in row["acceptance"]:
         lines.append(f"- [ ] {ac}")
@@ -121,10 +120,129 @@ def add_ac_comment(issue_number, row):
     comment_body = "\n".join(lines)
 
     run_gh([
-        "issue", "comment", str(issue_number),
-        "--repo", f"{OWNER}/{REPO}",
-        "--body", comment_body
+        "api",
+        f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments",
+        "-f", f"body={comment_body}"
     ])
+
+    print(f'Added AC checklist comment to issue #{issue_number}')
+
+
+def get_project_id_and_status_field():
+    query = """
+    query($owner:String!, $number:Int!) {
+      user(login:$owner) {
+        projectV2(number:$number) {
+          id
+          fields(first:50) {
+            nodes {
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    output = run_gh([
+        "api", "graphql",
+        "-f", f"query={query}",
+        "-F", f"owner={PROJECT_OWNER}",
+        "-F", f"number={PROJECT_NUMBER}"
+    ])
+
+    data = json.loads(output)
+    project = data["data"]["user"]["projectV2"]
+
+    if not project:
+        raise RuntimeError("Project not found. Check PROJECT_OWNER and PROJECT_NUMBER.")
+
+    status_field = None
+
+    for field in project["fields"]["nodes"]:
+        if field and field.get("name") == "Status":
+            status_field = field
+            break
+
+    if not status_field:
+        raise RuntimeError("Status field not found in project board.")
+
+    return project["id"], status_field
+
+
+def add_issue_to_project(project_id, issue_node_id):
+    mutation = """
+    mutation($projectId:ID!, $contentId:ID!) {
+      addProjectV2ItemById(input: {
+        projectId: $projectId,
+        contentId: $contentId
+      }) {
+        item {
+          id
+        }
+      }
+    }
+    """
+
+    output = run_gh([
+        "api", "graphql",
+        "-f", f"query={mutation}",
+        "-F", f"projectId={project_id}",
+        "-F", f"contentId={issue_node_id}"
+    ])
+
+    data = json.loads(output)
+    return data["data"]["addProjectV2ItemById"]["item"]["id"]
+
+
+def update_project_status(project_id, item_id, status_field, status_name):
+    option_id = None
+
+    for option in status_field["options"]:
+        if option["name"].lower() == status_name.lower():
+            option_id = option["id"]
+            break
+
+    if not option_id:
+        available = [option["name"] for option in status_field["options"]]
+        raise RuntimeError(
+            f"Status option '{status_name}' not found. Available: {available}"
+        )
+
+    mutation = """
+    mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId,
+        itemId: $itemId,
+        fieldId: $fieldId,
+        value: {
+          singleSelectOptionId: $optionId
+        }
+      }) {
+        projectV2Item {
+          id
+        }
+      }
+    }
+    """
+
+    run_gh([
+        "api", "graphql",
+        "-f", f"query={mutation}",
+        "-F", f"projectId={project_id}",
+        "-F", f"itemId={item_id}",
+        "-F", f"fieldId={status_field['id']}",
+        "-F", f"optionId={option_id}"
+    ])
+
+    print(f"Moved project item to {status_name}")
 
 
 def main():
@@ -139,6 +257,8 @@ def main():
             "SN | User Stories | Acceptance Criteria"
         )
 
+    project_id, status_field = get_project_id_and_status_field()
+
     for row in rows:
         existing = find_existing_issue(row)
 
@@ -146,10 +266,13 @@ def main():
             print(f'Skipping {row["id"]} because issue already exists.')
             continue
 
-        issue_number = create_issue(row)
+        issue_number, issue_node_id = create_issue(row)
         add_ac_comment(issue_number, row)
 
-        print(f'Imported {row["id"]} as issue #{issue_number}')
+        item_id = add_issue_to_project(project_id, issue_node_id)
+        update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
+
+        print(f'Imported {row["id"]} into project board as {DEFAULT_STATUS}')
 
 
 if __name__ == "__main__":
