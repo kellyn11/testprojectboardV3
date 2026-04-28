@@ -38,7 +38,7 @@ jobs:
           OWNER: kellyn11
           REPO: testprojectboardV3
           PROJECT_OWNER: kellyn11
-          PROJECT_NUMBER: 6
+          PROJECT_NUMBER: 7
           DEFAULT_STATUS: Backlog
         run: |
           python scripts/create_issues.py
