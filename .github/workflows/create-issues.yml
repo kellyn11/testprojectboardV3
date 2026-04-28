@@ -30,6 +30,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: kellyn11
-          REPO: ${{ github.repository }}
+          REPO: testprojectboardV3
         run: |
           python scripts/create_issues.py
