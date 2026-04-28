@@ -37,22 +37,20 @@ def extract_story_rows_from_docx():
         if not rows:
             continue
 
-        header = [clean_text(c.text) for c in rows[0].cells[:3]]
+        header = [clean_text(c.text) for c in rows[0].cells[:2]]
 
-        if header != ["SN", "User Stories", "Acceptance Criteria"]:
+        # EXPECTS:
+        # User Stories | Acceptance Criteria
+        if header != ["User Stories", "Acceptance Criteria"]:
             continue
 
         for row in rows[1:]:
             cells = row.cells
-            if len(cells) < 3:
+            if len(cells) < 2:
                 continue
 
-            sn = clean_text(cells[0].text)
-            story = clean_text(cells[1].text)
-            ac_raw = cells[2].text.strip()
-
-            if not re.fullmatch(r"\d+", sn or ""):
-                continue
+            story = clean_text(cells[0].text)
+            ac_raw = cells[1].text.strip()
 
             if not story:
                 continue
@@ -64,7 +62,6 @@ def extract_story_rows_from_docx():
                     ac_lines.append(line)
 
             rows_out.append({
-                "id": f"US{sn}",
                 "story": story,
                 "acceptance": ac_lines
             })
@@ -72,31 +69,57 @@ def extract_story_rows_from_docx():
     return rows_out
 
 
-def find_existing_issue(row):
+def find_existing_issue_by_title(story):
     output = run_gh([
         "issue", "list",
         "--repo", f"{OWNER}/{REPO}",
         "--state", "all",
-        "--search", row["id"],
+        "--search", story,
         "--json", "number,title,state"
     ])
 
     issues = json.loads(output)
 
     for issue in issues:
-        if issue["title"].startswith(f'{row["id"]} -'):
+        if clean_text(issue["title"]) == clean_text(story):
             return issue
 
     return None
 
 
-def create_issue(row):
-    title = f'{row["id"]} - {row["story"]}'
+def create_or_update_issue(row):
+    title = row["story"]
 
     body = f"""User Story:
 
 {row["story"]}
 """
+
+    existing = find_existing_issue_by_title(row["story"])
+
+    if existing:
+        issue_number = existing["number"]
+
+        run_gh([
+            "issue", "edit", str(issue_number),
+            "--repo", f"{OWNER}/{REPO}",
+            "--title", title,
+            "--body", body
+        ])
+
+        if existing["state"] == "CLOSED":
+            run_gh([
+                "issue", "reopen", str(issue_number),
+                "--repo", f"{OWNER}/{REPO}"
+            ])
+
+        issue_data = json.loads(run_gh([
+            "api",
+            f"repos/{OWNER}/{REPO}/issues/{issue_number}"
+        ]))
+
+        print(f"Updated existing issue #{issue_number}")
+        return issue_number, issue_data["node_id"]
 
     output = run_gh([
         "api",
@@ -107,25 +130,57 @@ def create_issue(row):
 
     issue = json.loads(output)
 
-    print(f'Created {row["id"]} as issue #{issue["number"]}')
+    print(f"Created issue #{issue['number']}")
     return issue["number"], issue["node_id"]
 
 
-def add_ac_comment(issue_number, row):
-    lines = ["Acceptance Criteria", ""]
+def build_ac_comment(row):
+    lines = [
+        "Acceptance Criteria",
+        ""
+    ]
 
     for ac in row["acceptance"]:
         lines.append(f"- [ ] {ac}")
 
-    comment_body = "\n".join(lines)
+    return "\n".join(lines)
 
-    run_gh([
+
+def create_or_update_ac_comment(issue_number, row):
+    ac_body = build_ac_comment(row)
+
+    comments = json.loads(run_gh([
         "api",
-        f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments",
-        "-f", f"body={comment_body}"
-    ])
+        f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments"
+    ]))
 
-    print(f'Added AC checklist comment to issue #{issue_number}')
+    existing_ac_comment = None
+
+    for comment in comments:
+        body = comment.get("body", "")
+        if body.startswith("Acceptance Criteria"):
+            existing_ac_comment = comment
+            break
+
+    if existing_ac_comment:
+        comment_id = existing_ac_comment["id"]
+
+        run_gh([
+            "api",
+            "--method", "PATCH",
+            f"repos/{OWNER}/{REPO}/issues/comments/{comment_id}",
+            "-f", f"body={ac_body}"
+        ])
+
+        print(f"Updated AC checkbox comment for issue #{issue_number}")
+    else:
+        run_gh([
+            "api",
+            f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments",
+            "-f", f"body={ac_body}"
+        ])
+
+        print(f"Created AC checkbox comment for issue #{issue_number}")
 
 
 def get_project_id_and_status_field():
@@ -172,7 +227,7 @@ def get_project_id_and_status_field():
             break
 
     if not status_field:
-        raise RuntimeError("Status field not found in project board.")
+        raise RuntimeError("Status field not found.")
 
     return project["id"], status_field
 
@@ -212,9 +267,7 @@ def update_project_status(project_id, item_id, status_field, status_name):
 
     if not option_id:
         available = [option["name"] for option in status_field["options"]]
-        raise RuntimeError(
-            f"Status option '{status_name}' not found. Available: {available}"
-        )
+        raise RuntimeError(f"Status '{status_name}' not found. Available: {available}")
 
     mutation = """
     mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
@@ -253,26 +306,22 @@ def main():
 
     if not rows:
         raise RuntimeError(
-            "No stories found. Make sure Word table header is: "
-            "SN | User Stories | Acceptance Criteria"
+            "No stories found. Header must be: User Stories | Acceptance Criteria"
         )
 
     project_id, status_field = get_project_id_and_status_field()
 
     for row in rows:
-        existing = find_existing_issue(row)
+        issue_number, issue_node_id = create_or_update_issue(row)
+        create_or_update_ac_comment(issue_number, row)
 
-        if existing:
-            print(f'Skipping {row["id"]} because issue already exists.')
-            continue
+        try:
+            item_id = add_issue_to_project(project_id, issue_node_id)
+            update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
+        except subprocess.CalledProcessError:
+            print(f"Issue #{issue_number} may already be in the project. Skipping project add.")
 
-        issue_number, issue_node_id = create_issue(row)
-        add_ac_comment(issue_number, row)
-
-        item_id = add_issue_to_project(project_id, issue_node_id)
-        update_project_status(project_id, item_id, status_field, DEFAULT_STATUS)
-
-        print(f'Imported {row["id"]} into project board as {DEFAULT_STATUS}')
+        print(f"Imported issue #{issue_number}")
 
 
 if __name__ == "__main__":
