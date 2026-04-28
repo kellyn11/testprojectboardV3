@@ -4,15 +4,21 @@ import re
 import subprocess
 from pathlib import Path
 from docx import Document
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.pdfgen import canvas
 
 OWNER = os.environ["OWNER"]
+REPO = os.environ["REPO"]
 PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
+
 DOCX_PATH = Path("input/stories.docx")
-TXT_OUTPUT = Path("output/status_report.txt")
-PDF_OUTPUT = Path("output/status_report.pdf")
+
+VALID_STATUSES = {
+    "backlog": "Backlog",
+    "todo": "Todo",
+    "to-do": "Todo",
+    "in progress": "In Progress",
+    "qa review": "QA Review",
+    "done": "Done",
+}
 
 
 def run_gh(args):
@@ -27,6 +33,11 @@ def run_gh(args):
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def normalize_status(status: str) -> str:
+    value = clean_text(status).lower()
+    return VALID_STATUSES.get(value, "Backlog")
 
 
 def extract_story_rows_from_docx():
@@ -47,11 +58,10 @@ def extract_story_rows_from_docx():
         if not rows:
             continue
 
-        header = [clean_text(c.text) for c in rows[0].cells[:3]]
-        if len(header) < 3:
-            continue
+        header = [clean_text(c.text) for c in rows[0].cells]
 
-        if header[0] != "SN" or header[1] != "User Stories" or header[2] != "Acceptance Criteria":
+        required_headers = ["SN", "Status", "User Stories", "Acceptance Criteria"]
+        if header[:4] != required_headers:
             continue
 
         if section_index < len(section_candidates):
@@ -60,21 +70,23 @@ def extract_story_rows_from_docx():
 
         for row in rows[1:]:
             cells = row.cells
-            if len(cells) < 3:
+            if len(cells) < 4:
                 continue
 
             sn = clean_text(cells[0].text)
-            story = clean_text(cells[1].text)
-            ac_raw = cells[2].text.strip()
+            status = normalize_status(cells[1].text)
+            story = clean_text(cells[2].text)
+            ac_raw = cells[3].text.strip()
 
             if not re.fullmatch(r"\d+", sn or ""):
                 continue
+
             if not story:
                 continue
 
             ac_lines = []
             for line in ac_raw.splitlines():
-                line = line.strip()
+                line = clean_text(line)
                 if line:
                     ac_lines.append(line)
 
@@ -82,6 +94,7 @@ def extract_story_rows_from_docx():
                 "sn": int(sn),
                 "id": f"US{sn}",
                 "section": current_section,
+                "status": status,
                 "story": story,
                 "acceptance": ac_lines,
             })
@@ -89,29 +102,136 @@ def extract_story_rows_from_docx():
     return rows_out
 
 
-def get_project_items():
+def find_existing_issue(story_id):
+    search_query = f'repo:{OWNER}/{REPO} in:title "{story_id} -"'
+    output = run_gh([
+        "issue", "list",
+        "--repo", f"{OWNER}/{REPO}",
+        "--state", "all",
+        "--search", search_query,
+        "--json", "number,title,state"
+    ])
+
+    issues = json.loads(output)
+
+    for issue in issues:
+        if issue["title"].startswith(f"{story_id} -"):
+            return issue
+
+    return None
+
+
+def create_or_update_issue(row):
+    story_id = row["id"]
+    title = f"{story_id} - {row['story']}"
+
+    body = f"""Section: {row['section']}
+
+User Story:
+{row['story']}
+"""
+
+    existing_issue = find_existing_issue(story_id)
+
+    if existing_issue:
+        issue_number = existing_issue["number"]
+
+        run_gh([
+            "issue", "edit", str(issue_number),
+            "--repo", f"{OWNER}/{REPO}",
+            "--title", title,
+            "--body", body
+        ])
+
+        if existing_issue["state"] == "CLOSED":
+            run_gh([
+                "issue", "reopen", str(issue_number),
+                "--repo", f"{OWNER}/{REPO}"
+            ])
+
+        print(f"Updated issue {story_id}")
+        return issue_number
+
+    output = run_gh([
+        "issue", "create",
+        "--repo", f"{OWNER}/{REPO}",
+        "--title", title,
+        "--body", body,
+        "--json", "number"
+    ])
+
+    issue = json.loads(output)
+    issue_number = issue["number"]
+
+    print(f"Created issue {story_id}")
+    return issue_number
+
+
+def build_ac_comment(row):
+    lines = ["Acceptance Criteria", ""]
+
+    for ac in row["acceptance"]:
+        lines.append(f"- [ ] {ac}")
+
+    return "\n".join(lines)
+
+
+def get_issue_comments(issue_number):
+    output = run_gh([
+        "api",
+        f"repos/{OWNER}/{REPO}/issues/{issue_number}/comments"
+    ])
+
+    return json.loads(output)
+
+
+def create_or_update_ac_comment(issue_number, row):
+    comments = get_issue_comments(issue_number)
+    ac_body = build_ac_comment(row)
+
+    existing_ac_comment = None
+
+    for comment in comments:
+        body = comment.get("body", "")
+        if body.startswith("Acceptance Criteria"):
+            existing_ac_comment = comment
+            break
+
+    if existing_ac_comment:
+        comment_id = existing_ac_comment["id"]
+
+        run_gh([
+            "api",
+            "--method", "PATCH",
+            f"repos/{OWNER}/{REPO}/issues/comments/{comment_id}",
+            "-f", f"body={ac_body}"
+        ])
+
+        print(f"Updated AC comment for issue #{issue_number}")
+    else:
+        run_gh([
+            "issue", "comment", str(issue_number),
+            "--repo", f"{OWNER}/{REPO}",
+            "--body", ac_body
+        ])
+
+        print(f"Created AC comment for issue #{issue_number}")
+
+
+def get_project_id_and_status_field():
     query = """
     query($owner:String!, $number:Int!) {
       user(login:$owner) {
         projectV2(number:$number) {
-          items(first:100) {
+          id
+          fields(first:50) {
             nodes {
-              fieldValues(first:20) {
-                nodes {
-                  ... on ProjectV2ItemFieldSingleSelectValue {
-                    name
-                    field {
-                      ... on ProjectV2SingleSelectField {
-                        name
-                      }
-                    }
-                  }
-                }
-              }
-              content {
-                ... on Issue {
-                  title
-                  number
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options {
+                  id
+                  name
                 }
               }
             }
@@ -121,161 +241,100 @@ def get_project_items():
     }
     """
 
-    out = run_gh([
+    output = run_gh([
         "api", "graphql",
         "-f", f"query={query}",
         "-F", f"owner={OWNER}",
         "-F", f"number={PROJECT_NUMBER}",
     ])
 
-    data = json.loads(out)
-    nodes = data["data"]["user"]["projectV2"]["items"]["nodes"]
+    data = json.loads(output)
+    project = data["data"]["user"]["projectV2"]
 
-    status_map = {}
-    for item in nodes:
-        content = item.get("content")
-        if not content:
-            continue
+    status_field = None
 
-        title = content.get("title", "")
-        m = re.match(r"^US(\d+)\b", title)
-        if not m:
-            continue
+    for field in project["fields"]["nodes"]:
+        if field and field.get("name") == "Status":
+            status_field = field
+            break
 
-        sn = int(m.group(1))
-        status = "Todo"
+    if not status_field:
+        raise RuntimeError("Status field not found in project board.")
 
-        for fv in item.get("fieldValues", {}).get("nodes", []):
-            field = fv.get("field")
-            if field and field.get("name") == "Status":
-                status = fv.get("name", "Todo")
-                break
-
-        status_map[sn] = status
-
-    return status_map
+    return project["id"], status_field
 
 
-def marker_for_status(status: str) -> str:
-    s = (status or "").strip().lower()
-    if s == "done":
-        return "[X]"
-    if s == "in progress":
-        return "[-]"
-    return "[ ]"
+def get_issue_node_id(issue_number):
+    output = run_gh([
+        "api",
+        f"repos/{OWNER}/{REPO}/issues/{issue_number}"
+    ])
+
+    issue = json.loads(output)
+    return issue["node_id"]
 
 
-def wrap_text(text: str, font_name: str, font_size: int, max_width: float):
-    words = text.split()
-    if not words:
-        return [""]
+def add_issue_to_project(project_id, issue_node_id):
+    mutation = """
+    mutation($projectId:ID!, $contentId:ID!) {
+      addProjectV2ItemById(input: {
+        projectId: $projectId,
+        contentId: $contentId
+      }) {
+        item {
+          id
+        }
+      }
+    }
+    """
 
-    lines = []
-    current = words[0]
+    output = run_gh([
+        "api", "graphql",
+        "-f", f"query={mutation}",
+        "-F", f"projectId={project_id}",
+        "-F", f"contentId={issue_node_id}",
+    ])
 
-    for word in words[1:]:
-        test = current + " " + word
-        if stringWidth(test, font_name, font_size) <= max_width:
-            current = test
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
-
-
-def write_txt_report(rows, status_map):
-    done_count = 0
-    total_count = len(rows)
-
-    lines = [
-        "Project Functional Requirement Progress",
-        "",
-        "Legend:",
-        "[X] Done",
-        "[-] In Progress",
-        "[ ] Todo",
-        "",
-    ]
-
-    for row in rows:
-        status = status_map.get(row["sn"], "Todo")
-        marker = marker_for_status(status)
-        if marker == "[X]":
-            done_count += 1
-        lines.append(f"{marker} {row['id']} - {row['story']}")
-
-    lines.append("")
-    lines.append(f"Completion: {done_count} / {total_count} Completed")
-    progress = round((done_count / total_count) * 100) if total_count else 0
-    lines.append(f"Progress: {progress}%")
-
-    TXT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    TXT_OUTPUT.write_text("\n".join(lines), encoding="utf-8")
+    data = json.loads(output)
+    return data["data"]["addProjectV2ItemById"]["item"]["id"]
 
 
-def write_pdf_report(rows, status_map):
-    PDF_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+def update_project_status(project_id, item_id, status_field, status_name):
+    option_id = None
 
-    c = canvas.Canvas(str(PDF_OUTPUT), pagesize=A4)
-    width, height = A4
+    for option in status_field["options"]:
+        if option["name"].lower() == status_name.lower():
+            option_id = option["id"]
+            break
 
-    left = 50
-    right = 50
-    top = height - 50
-    bottom = 50
-    line_gap = 16
-    usable_width = width - left - right
+    if not option_id:
+        raise RuntimeError(f"Status option not found in board: {status_name}")
 
-    done_count = sum(1 for r in rows if marker_for_status(status_map.get(r["sn"], "Todo")) == "[X]")
-    total_count = len(rows)
-    progress = round((done_count / total_count) * 100) if total_count else 0
+    mutation = """
+    mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId,
+        itemId: $itemId,
+        fieldId: $fieldId,
+        value: {
+          singleSelectOptionId: $optionId
+        }
+      }) {
+        projectV2Item {
+          id
+        }
+      }
+    }
+    """
 
-    y = top
-
-    def new_page():
-        nonlocal y
-        c.showPage()
-        y = top
-
-    def draw_line(text, font="Helvetica", size=11, indent=0):
-        nonlocal y
-        max_width = usable_width - indent
-        wrapped = wrap_text(text, font, size, max_width)
-        for part in wrapped:
-            if y < bottom:
-                new_page()
-            c.setFont(font, size)
-            c.drawString(left + indent, y, part)
-            y -= line_gap
-
-    c.setTitle("Project Functional Requirement Progress")
-
-    draw_line("Project Functional Requirement Progress", font="Helvetica-Bold", size=16)
-    y -= 4
-    draw_line("Legend:", font="Helvetica-Bold", size=11)
-    draw_line("[X] Done")
-    draw_line("[-] In Progress")
-    draw_line("[ ] Todo")
-    y -= 6
-
-    current_section = None
-    for row in rows:
-        section = row["section"]
-        if section != current_section:
-            current_section = section
-            y -= 4
-            draw_line(section, font="Helvetica-Bold", size=12)
-
-        status = status_map.get(row["sn"], "Todo")
-        marker = marker_for_status(status)
-        draw_line(f"{marker} {row['id']} - {row['story']}", font="Helvetica", size=11)
-
-    y -= 8
-    draw_line(f"Completion: {done_count} / {total_count} Completed", font="Helvetica-Bold", size=11)
-    draw_line(f"Progress: {progress}%", font="Helvetica-Bold", size=11)
-
-    c.save()
+    run_gh([
+        "api", "graphql",
+        "-f", f"query={mutation}",
+        "-F", f"projectId={project_id}",
+        "-F", f"itemId={item_id}",
+        "-F", f"fieldId={status_field['id']}",
+        "-F", f"optionId={option_id}",
+    ])
 
 
 def main():
@@ -285,13 +344,17 @@ def main():
     rows = extract_story_rows_from_docx()
     rows.sort(key=lambda x: x["sn"])
 
-    status_map = get_project_items()
+    project_id, status_field = get_project_id_and_status_field()
 
-    write_txt_report(rows, status_map)
-    write_pdf_report(rows, status_map)
+    for row in rows:
+        issue_number = create_or_update_issue(row)
+        create_or_update_ac_comment(issue_number, row)
 
-    print(f"Generated {TXT_OUTPUT}")
-    print(f"Generated {PDF_OUTPUT}")
+        issue_node_id = get_issue_node_id(issue_number)
+        item_id = add_issue_to_project(project_id, issue_node_id)
+        update_project_status(project_id, item_id, status_field, row["status"])
+
+        print(f"Synced {row['id']} to project status: {row['status']}")
 
 
 if __name__ == "__main__":
