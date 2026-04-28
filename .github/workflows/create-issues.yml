@@ -25,13 +25,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install python-docx
 
+       - name: Test GitHub auth and project access
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh auth status
+          gh project view 1 --owner kellyn11
+
       - name: Run issue sync script
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           OWNER: kellyn11
           REPO: testprojectboardV3
           PROJECT_OWNER: kellyn11
-          PROJECT_NUMBER: 1
-          DEFAULT_STATUS: Todo
+          PROJECT_NUMBER: 6
+          DEFAULT_STATUS: Backlog
         run: |
           python scripts/create_issues.py
