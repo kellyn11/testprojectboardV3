@@ -1,4 +1,3 @@
-# scripts/create_issues.py
 import json
 import os
 import re
@@ -347,14 +346,8 @@ def ensure_issue_in_project_with_status(project_id, status_field, issue_number, 
         item_id = add_issue_to_project(project_id, issue_node_id)
         print(f"Added issue #{issue_number} to project")
 
-        # Give GitHub time to finish adding the item
+        # Give GitHub a short moment before setting status
         time.sleep(2)
-
-        item_id = get_project_item_id_for_issue(project_id, issue_number)
-
-        if not item_id:
-            raise RuntimeError(f"Issue #{issue_number} was added but cannot be found in project.")
-
     else:
         print(f"Issue #{issue_number} already exists in project")
 
