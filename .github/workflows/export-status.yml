@@ -27,15 +27,19 @@ jobs:
 
       - name: Run export status script
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          OWNER: kellyn11
+          REPO: testprojectboardV3
+          PROJECT_OWNER: kellyn11
+          PROJECT_NUMBER: 18
         run: |
           python scripts/export_status.py
 
-      - name: Commit generated report
+      - name: Commit generated reports
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add output/status_report.txt output/status_report.pdf
+          git add output/user_report.pdf output/project_officer_report.pdf
           git commit -m "Update status reports" || echo "No changes to commit"
           git push
