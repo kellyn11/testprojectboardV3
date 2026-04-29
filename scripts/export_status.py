@@ -11,11 +11,15 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.units import mm
 
-
+OWNER = os.environ["OWNER"]
 REPO = os.environ["REPO"]
+PROJECT_OWNER = os.environ["PROJECT_OWNER"]
+PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
+
 DOCX_PATH = Path("input/stories.docx")
-TXT_OUTPUT = Path("output/status_report.txt")
-PDF_OUTPUT = Path("output/status_report.pdf")
+
+USER_PDF_OUTPUT = Path("output/user_report.pdf")
+OFFICER_PDF_OUTPUT = Path("output/project_officer_report.pdf")
 
 
 def run_gh(args):
@@ -28,227 +32,200 @@ def run_gh(args):
     return result.stdout.strip()
 
 
-def clean_text(text: str) -> str:
+def clean_text(text):
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def generate_title_from_story(story):
+    match = re.search(r"I want to (.*?)(?: so that|$)", story, re.IGNORECASE)
+    title = match.group(1).strip() if match else story.strip()
+
+    if not title:
+        return "Untitled Story"
+
+    return title[:1].upper() + title[1:]
 
 
 def extract_story_rows_from_docx():
     doc = Document(str(DOCX_PATH))
+    rows_out = []
 
-    section_candidates = []
+    current_section = "General"
+
     for p in doc.paragraphs:
         txt = clean_text(p.text)
         if re.match(r"^\d+\.\d+\s+", txt):
-            section_candidates.append(txt)
-
-    section_index = 0
-    current_section = "General"
-    rows_out = []
+            current_section = txt
 
     for table in doc.tables:
         rows = table.rows
         if not rows:
             continue
 
-        header = [clean_text(c.text) for c in rows[0].cells[:3]]
-        if len(header) < 3:
-            continue
+        header = [clean_text(c.text) for c in rows[0].cells[:2]]
 
-        if header[0] != "SN" or header[1] != "User Stories" or header[2] != "Acceptance Criteria":
+        if header != ["User Stories", "Acceptance Criteria"]:
             continue
-
-        if section_index < len(section_candidates):
-            current_section = section_candidates[section_index]
-            section_index += 1
 
         for row in rows[1:]:
             cells = row.cells
-            if len(cells) < 3:
+            if len(cells) < 2:
                 continue
 
-            sn = clean_text(cells[0].text)
-            story = clean_text(cells[1].text)
-            ac_raw = cells[2].text.strip()
+            story = clean_text(cells[0].text)
+            ac_raw = cells[1].text.strip()
 
-            if not re.fullmatch(r"\d+", sn or ""):
-                continue
             if not story:
                 continue
 
             ac_lines = []
             for line in ac_raw.splitlines():
-                line = line.strip()
+                line = clean_text(line)
                 if line:
                     ac_lines.append(line)
 
-            rows_out.append(
-                {
-                    "sn": int(sn),
-                    "id": f"US{sn}",
-                    "section": current_section,
-                    "story": story,
-                    "acceptance": ac_lines,
-                }
-            )
+            rows_out.append({
+                "title": generate_title_from_story(story),
+                "story": story,
+                "acceptance": ac_lines,
+                "section": current_section,
+            })
 
     return rows_out
 
 
-def get_issue_status_map():
-    out = run_gh(
-        [
-            "issue",
-            "list",
-            "--repo",
-            REPO,
-            "--state",
-            "all",
-            "--limit",
-            "200",
-            "--json",
-            "title,state,labels",
-        ]
-    )
+def get_project_status_map():
+    query = """
+    query($owner:String!, $number:Int!) {
+      user(login:$owner) {
+        projectV2(number:$number) {
+          items(first:100) {
+            nodes {
+              content {
+                ... on Issue {
+                  number
+                  title
+                }
+              }
+              fieldValues(first:20) {
+                nodes {
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    field {
+                      ... on ProjectV2SingleSelectField {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
 
-    issues = json.loads(out)
+    output = run_gh([
+        "api", "graphql",
+        "-f", f"query={query}",
+        "-F", f"owner={PROJECT_OWNER}",
+        "-F", f"number={PROJECT_NUMBER}",
+    ])
+
+    data = json.loads(output)
+    items = data["data"]["user"]["projectV2"]["items"]["nodes"]
+
     status_map = {}
 
-    for issue in issues:
-        title = issue.get("title", "")
-        m = re.match(r"^US(\d+)\b", title)
-        if not m:
+    for item in items:
+        content = item.get("content")
+        if not content:
             continue
 
-        sn = int(m.group(1))
-        state = (issue.get("state") or "").lower()
-        labels = [lbl.get("name", "").lower() for lbl in issue.get("labels", [])]
+        issue_title = clean_text(content.get("title", ""))
+        issue_number = content.get("number")
 
-        if state == "closed":
-            status = "Done"
-        elif "in-progress" in labels:
-            status = "In Progress"
-        else:
-            status = "Todo"
+        status = "No Status"
 
-        status_map[sn] = status
+        for fv in item.get("fieldValues", {}).get("nodes", []):
+            field = fv.get("field")
+            if field and field.get("name") == "Status":
+                status = fv.get("name", "No Status")
+                break
+
+        status_map[issue_title] = {
+            "status": status,
+            "issue_number": issue_number,
+        }
 
     return status_map
 
 
-def marker_for_status(status: str) -> str:
+def marker_for_status(status):
     s = (status or "").strip().lower()
+
     if s == "done":
         return "[X]"
-    if s == "in progress":
+    if s in ["in progress", "qa review"]:
         return "[-]"
     return "[ ]"
 
 
-def format_acceptance(ac_lines):
-    if not ac_lines:
-        return ""
-    return "\n".join(ac_lines)
+def build_table_data(rows, status_map, persona):
+    if persona == "user":
+        table_data = [[
+            Paragraph("<b>Status</b>", styles["BodyText"]),
+            Paragraph("<b>Story</b>", styles["BodyText"]),
+            Paragraph("<b>Acceptance Criteria</b>", styles["BodyText"]),
+        ]]
+
+        for row in rows:
+            info = status_map.get(row["title"], {})
+            status = info.get("status", "No Status")
+            marker = marker_for_status(status)
+
+            ac_text = "<br/>".join(row["acceptance"]) if row["acceptance"] else ""
+
+            table_data.append([
+                Paragraph(f"{marker}<br/>{status}", styles["BodyText"]),
+                Paragraph(row["title"], styles["BodyText"]),
+                Paragraph(ac_text, styles["BodyText"]),
+            ])
+
+    else:
+        table_data = [[
+            Paragraph("<b>Issue #</b>", styles["BodyText"]),
+            Paragraph("<b>Status</b>", styles["BodyText"]),
+            Paragraph("<b>Section</b>", styles["BodyText"]),
+            Paragraph("<b>Story</b>", styles["BodyText"]),
+            Paragraph("<b>Acceptance Criteria</b>", styles["BodyText"]),
+        ]]
+
+        for row in rows:
+            info = status_map.get(row["title"], {})
+            status = info.get("status", "No Status")
+            issue_number = info.get("issue_number", "-")
+            marker = marker_for_status(status)
+
+            ac_text = "<br/>".join(row["acceptance"]) if row["acceptance"] else ""
+
+            table_data.append([
+                Paragraph(str(issue_number), styles["BodyText"]),
+                Paragraph(f"{marker}<br/>{status}", styles["BodyText"]),
+                Paragraph(row["section"], styles["BodyText"]),
+                Paragraph(row["title"], styles["BodyText"]),
+                Paragraph(ac_text, styles["BodyText"]),
+            ])
+
+    return table_data
 
 
-def write_txt_report(rows, status_map):
-    done_count = 0
-    total_count = len(rows)
-
-    # widths
-    sn_w = 4
-    st_w = 8
-    us_w = 55
-    ac_w = 40
-
-    def wrap(text, width):
-        words = text.split()
-        if not words:
-            return [""]
-        lines = []
-        current = words[0]
-        for word in words[1:]:
-            test = current + " " + word
-            if len(test) <= width:
-                current = test
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
-        return lines
-
-    def row_border():
-        return "+" + "-" * (sn_w + 2) + "+" + "-" * (st_w + 2) + "+" + "-" * (us_w + 2) + "+" + "-" * (ac_w + 2) + "+"
-
-    lines = []
-    lines.append("Project Functional Requirement Progress")
-    lines.append("")
-    lines.append("Legend:")
-    lines.append("[X] Done")
-    lines.append("[-] In Progress")
-    lines.append("[ ] Todo")
-    lines.append("")
-
-    current_section = None
-
-    for row in rows:
-        if row["section"] != current_section:
-            current_section = row["section"]
-            lines.append(current_section)
-            lines.append(row_border())
-            lines.append(
-                f"| {'SN'.ljust(sn_w)} | {'Status'.ljust(st_w)} | {'User Stories'.ljust(us_w)} | {'Acceptance Criteria'.ljust(ac_w)} |"
-            )
-            lines.append(row_border())
-
-        status = status_map.get(row["sn"], "Todo")
-        marker = marker_for_status(status)
-        if marker == "[X]":
-            done_count += 1
-
-        story_lines = wrap(row["story"], us_w)
-        ac_lines = []
-        for ac in row["acceptance"]:
-            ac_lines.extend(wrap(ac, ac_w))
-        if not ac_lines:
-            ac_lines = [""]
-
-        max_lines = max(len(story_lines), len(ac_lines))
-
-        for i in range(max_lines):
-            sn = str(row["sn"]).ljust(sn_w) if i == 0 else " " * sn_w
-            st = marker.ljust(st_w) if i == 0 else " " * st_w
-            us = story_lines[i].ljust(us_w) if i < len(story_lines) else " " * us_w
-            ac = ac_lines[i].ljust(ac_w) if i < len(ac_lines) else " " * ac_w
-            lines.append(f"| {sn} | {st} | {us} | {ac} |")
-
-        lines.append(row_border())
-
-    lines.append("")
-    lines.append(f"Completion: {done_count} / {total_count} Completed")
-    progress = round((done_count / total_count) * 100) if total_count else 0
-    lines.append(f"Progress: {progress}%")
-
-    TXT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    TXT_OUTPUT.write_text("\n".join(lines), encoding="utf-8")
-
-
-def write_pdf_report(rows, status_map):
-    PDF_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-
-    styles = getSampleStyleSheet()
-    title_style = styles["Title"]
-    normal_style = styles["BodyText"]
-    normal_style.fontName = "Helvetica"
-    normal_style.fontSize = 9
-    normal_style.leading = 11
-
-    section_style = styles["Heading3"]
-    section_style.fontName = "Helvetica-Bold"
-    section_style.fontSize = 11
-    section_style.leading = 13
+def write_pdf_report(rows, status_map, output_path, persona):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     doc = SimpleDocTemplate(
-        str(PDF_OUTPUT),
+        str(output_path),
         pagesize=landscape(A4),
         leftMargin=10 * mm,
         rightMargin=10 * mm,
@@ -258,73 +235,52 @@ def write_pdf_report(rows, status_map):
 
     elements = []
 
-    done_count = 0
-    total_count = len(rows)
+    if persona == "user":
+        title = "User Story Status Report"
+    else:
+        title = "Project Officer Status Report"
 
-    elements.append(Paragraph("Project Functional Requirement Progress", title_style))
-    elements.append(Spacer(1, 6))
-    elements.append(Paragraph("Legend: [X] Done &nbsp;&nbsp;&nbsp; [-] In Progress &nbsp;&nbsp;&nbsp; [ ] Todo", normal_style))
+    elements.append(Paragraph(title, styles["Title"]))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(
+        "Legend: [X] Done &nbsp;&nbsp;&nbsp; [-] In Progress / QA Review &nbsp;&nbsp;&nbsp; [ ] Backlog / Todo / No Status",
+        styles["BodyText"]
+    ))
     elements.append(Spacer(1, 10))
 
-    current_section = None
+    table_data = build_table_data(rows, status_map, persona)
 
-    for row in rows:
-        if row["section"] != current_section:
-            current_section = row["section"]
-            elements.append(Paragraph(current_section, section_style))
-            elements.append(Spacer(1, 4))
+    if persona == "user":
+        col_widths = [35 * mm, 95 * mm, 140 * mm]
+    else:
+        col_widths = [20 * mm, 35 * mm, 45 * mm, 80 * mm, 95 * mm]
 
-            table_data = [[
-                Paragraph("<b>SN</b>", normal_style),
-                Paragraph("<b>Status</b>", normal_style),
-                Paragraph("<b>User Stories</b>", normal_style),
-                Paragraph("<b>Acceptance Criteria</b>", normal_style),
-            ]]
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
 
-            section_rows = [r for r in rows if r["section"] == current_section]
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
 
-            for r in section_rows:
-                status = status_map.get(r["sn"], "Todo")
-                marker = marker_for_status(status)
-                if marker == "[X]":
-                    done_count += 1
+    elements.append(table)
 
-                ac_text = "<br/>".join(r["acceptance"]) if r["acceptance"] else ""
-
-                table_data.append([
-                    Paragraph(str(r["sn"]), normal_style),
-                    Paragraph(marker, normal_style),
-                    Paragraph(r["story"], normal_style),
-                    Paragraph(ac_text, normal_style),
-                ])
-
-            tbl = Table(
-                table_data,
-                colWidths=[15 * mm, 22 * mm, 110 * mm, 110 * mm],
-                repeatRows=1,
-            )
-
-            tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("LEADING", (0, 0), (-1, -1), 11),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]))
-
-            elements.append(tbl)
-            elements.append(Spacer(1, 10))
-
+    done_count = sum(
+        1 for row in rows
+        if status_map.get(row["title"], {}).get("status") == "Done"
+    )
+    total_count = len(rows)
     progress = round((done_count / total_count) * 100) if total_count else 0
-    elements.append(Paragraph(f"<b>Completion:</b> {done_count} / {total_count} Completed", normal_style))
-    elements.append(Paragraph(f"<b>Progress:</b> {progress}%", normal_style))
+
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph(f"<b>Completion:</b> {done_count} / {total_count} Completed", styles["BodyText"]))
+    elements.append(Paragraph(f"<b>Progress:</b> {progress}%", styles["BodyText"]))
 
     doc.build(elements)
 
@@ -334,16 +290,23 @@ def main():
         raise FileNotFoundError(f"Missing {DOCX_PATH}")
 
     rows = extract_story_rows_from_docx()
-    rows.sort(key=lambda x: (x["section"], x["sn"]))
 
-    status_map = get_issue_status_map()
+    if not rows:
+        raise RuntimeError("No stories found. Header must be: User Stories | Acceptance Criteria")
 
-    write_txt_report(rows, status_map)
-    write_pdf_report(rows, status_map)
+    status_map = get_project_status_map()
 
-    print(f"Generated {TXT_OUTPUT}")
-    print(f"Generated {PDF_OUTPUT}")
+    write_pdf_report(rows, status_map, USER_PDF_OUTPUT, "user")
+    write_pdf_report(rows, status_map, OFFICER_PDF_OUTPUT, "officer")
 
+    print(f"Generated {USER_PDF_OUTPUT}")
+    print(f"Generated {OFFICER_PDF_OUTPUT}")
+
+
+styles = getSampleStyleSheet()
+styles["BodyText"].fontName = "Helvetica"
+styles["BodyText"].fontSize = 8
+styles["BodyText"].leading = 10
 
 if __name__ == "__main__":
     main()
